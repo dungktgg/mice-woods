@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart'; // Required for Clipboard access
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:async';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -121,19 +124,28 @@ class VocabState extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Exports data into clean, formatted JSON for Gemini/Backup
   String get exportedJson {
     const encoder = JsonEncoder.withIndent('  ');
     return encoder.convert(notes.map((e) => e.toJson()).toList());
   }
 
-  // Imports JSON and overwrites the local library
+  String get minifiedJson {
+    return json.encode(notes.map((e) => e.toJson()).toList());
+  }
+
   Future<bool> importJson(String jsonString) async {
     try {
       final List<dynamic> decoded = json.decode(jsonString);
       final importedNotes = decoded.map((e) => VocabNote.fromJson(e)).toList();
 
-      notes = importedNotes;
+      if (importedNotes.length == 1 && notes.isNotEmpty) {
+        if (!notes.any((n) => n.id == importedNotes.first.id)) {
+          notes.insert(0, importedNotes.first);
+        }
+      } else {
+        notes = importedNotes;
+      }
+
       _saveNotes();
       return true;
     } catch (e) {
@@ -169,6 +181,12 @@ class VocabState extends ChangeNotifier {
 
   void deleteNote(String id) {
     notes.removeWhere((n) => n.id == id);
+    _saveNotes();
+  }
+
+  // Multi-delete support
+  void deleteNotes(Set<String> ids) {
+    notes.removeWhere((n) => ids.contains(n.id));
     _saveNotes();
   }
 
@@ -214,6 +232,21 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> {
   String searchQuery = '';
 
+  // Selection mode variables
+  bool isSelectionMode = false;
+  Set<String> selectedIds = {};
+
+  void _toggleSelection(String id) {
+    setState(() {
+      if (selectedIds.contains(id)) {
+        selectedIds.remove(id);
+        if (selectedIds.isEmpty) isSelectionMode = false;
+      } else {
+        selectedIds.add(id);
+      }
+    });
+  }
+
   Widget _buildStaggeredGrid(List<VocabNote> filteredNotes) {
     if (filteredNotes.isEmpty) {
       return Center(
@@ -225,7 +258,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       );
     }
 
-    // Optimized lazy loader for massive lists
     return ListView.builder(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       itemCount: (filteredNotes.length / 2).ceil(),
@@ -233,13 +265,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
         int firstIndex = index * 2;
         int secondIndex = firstIndex + 1;
 
+        Widget buildCard(VocabNote note) {
+          return NoteCard(
+            note: note,
+            state: widget.state,
+            isSelectionMode: isSelectionMode,
+            isSelected: selectedIds.contains(note.id),
+            onTap: () {
+              if (isSelectionMode) {
+                _toggleSelection(note.id);
+              } else {
+                Navigator.push(context, MaterialPageRoute(builder: (_) => AddNoteScreen(state: widget.state, existingNote: note)));
+              }
+            },
+            onLongPress: () {
+              if (!isSelectionMode) {
+                setState(() {
+                  isSelectionMode = true;
+                  selectedIds.add(note.id);
+                });
+              }
+            },
+          );
+        }
+
         return Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Expanded(child: NoteCard(note: filteredNotes[firstIndex], state: widget.state)),
+            Expanded(child: buildCard(filteredNotes[firstIndex])),
             Expanded(
               child: secondIndex < filteredNotes.length
-                  ? NoteCard(note: filteredNotes[secondIndex], state: widget.state)
+                  ? buildCard(filteredNotes[secondIndex])
                   : const SizedBox(),
             ),
           ],
@@ -263,8 +319,60 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final isDark = widget.state.isDarkMode;
     final iconColor = isDark ? Colors.white : Colors.black;
 
+    final filteredNotes = widget.state.notes.where((note) {
+      return note.word.toLowerCase().contains(searchQuery) ||
+          note.meaning.toLowerCase().contains(searchQuery);
+    }).toList();
+
     return Scaffold(
-      appBar: AppBar(
+      appBar: isSelectionMode
+          ? AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () => setState(() {
+            isSelectionMode = false;
+            selectedIds.clear();
+          }),
+        ),
+        title: Text('${selectedIds.length} Selected'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.select_all),
+            tooltip: 'Select All',
+            onPressed: () {
+              setState(() {
+                selectedIds.addAll(filteredNotes.map((e) => e.id));
+              });
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete, color: Colors.redAccent),
+            tooltip: 'Delete Selected',
+            onPressed: () async {
+              final confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: const Text('Delete Notes?'),
+                    content: Text('Are you sure you want to delete ${selectedIds.length} notes?'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+                      TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete', style: TextStyle(color: Colors.red))),
+                    ],
+                  )
+              );
+              if (confirm == true) {
+                widget.state.deleteNotes(selectedIds);
+                setState(() {
+                  isSelectionMode = false;
+                  selectedIds.clear();
+                });
+              }
+            },
+          ),
+          const SizedBox(width: 8),
+        ],
+      )
+          : AppBar(
         title: const Text('My Library'),
         actions: [
           PopupMenuButton<String>(
@@ -287,35 +395,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   await Clipboard.setData(ClipboardData(text: widget.state.exportedJson));
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Library copied! Paste into AI to check.'),
-                      backgroundColor: Colors.green,
-                      behavior: SnackBarBehavior.floating,
-                    ),
+                    const SnackBar(content: Text('Library copied!'), backgroundColor: Colors.green),
                   );
                   break;
                 case 'import':
                   final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
                   final text = clipboardData?.text?.trim() ?? '';
-
-                  if (text.isEmpty) {
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Clipboard is empty!'), backgroundColor: Colors.orange),
-                    );
-                    return;
-                  }
+                  if (text.isEmpty) return;
 
                   final success = await widget.state.importJson(text);
-
                   if (!context.mounted) return;
-                  if (success) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(success ? 'Library updated!' : 'Invalid JSON!'), backgroundColor: success ? Colors.green : Colors.red),
+                  );
+                  break;
+                case 'qr_export_all':
+                  if (widget.state.notes.isEmpty) return;
+                  Navigator.push(context, MaterialPageRoute(
+                      builder: (_) => QRExportScreen(payload: widget.state.minifiedJson)
+                  ));
+                  break;
+                case 'qr_scan':
+                  final String? result = await Navigator.push(context, MaterialPageRoute(builder: (_) => const QRScannerScreen()));
+                  if (result != null && context.mounted) {
+                    final success = await widget.state.importJson(result);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Library successfully updated!'), backgroundColor: Colors.green),
-                    );
-                  } else {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Invalid JSON format! Could not import.'), backgroundColor: Colors.red),
+                      SnackBar(content: Text(success ? 'QR Data Imported!' : 'Invalid QR Data!'), backgroundColor: success ? Colors.green : Colors.red),
                     );
                   }
                   break;
@@ -324,60 +429,42 @@ class _LibraryScreenState extends State<LibraryScreen> {
             itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
               PopupMenuItem<String>(
                 value: 'theme',
-                child: Row(
-                  children: [
-                    Icon(isDark ? Icons.light_mode : Icons.dark_mode, color: iconColor),
-                    const SizedBox(width: 12),
-                    const Text('Toggle Theme'),
-                  ],
-                ),
+                child: Row(children: [Icon(isDark ? Icons.light_mode : Icons.dark_mode, color: iconColor), const SizedBox(width: 12), const Text('Toggle Theme')]),
               ),
               PopupMenuItem<String>(
                 value: 'flashcards',
-                child: Row(
-                  children: [
-                    Icon(Icons.style_outlined, color: iconColor),
-                    const SizedBox(width: 12),
-                    const Text('Flashcards'),
-                  ],
-                ),
+                child: Row(children: [Icon(Icons.style_outlined, color: iconColor), const SizedBox(width: 12), const Text('Flashcards')]),
               ),
               PopupMenuItem<String>(
                 value: 'quiz',
-                child: Row(
-                  children: [
-                    Icon(Icons.quiz_outlined, color: iconColor),
-                    const SizedBox(width: 12),
-                    const Text('Multiple Choice Quiz'),
-                  ],
-                ),
+                child: Row(children: [Icon(Icons.quiz_outlined, color: iconColor), const SizedBox(width: 12), const Text('Multiple Choice Quiz')]),
               ),
+              const PopupMenuDivider(),
               PopupMenuItem<String>(
                 value: 'export',
-                child: Row(
-                  children: [
-                    Icon(Icons.copy_all, color: iconColor),
-                    const SizedBox(width: 12),
-                    const Text('Export JSON'),
-                  ],
-                ),
+                child: Row(children: [Icon(Icons.copy_all, color: iconColor), const SizedBox(width: 12), const Text('Export JSON (Clipboard)')]),
               ),
               PopupMenuItem<String>(
                 value: 'import',
-                child: Row(
-                  children: [
-                    Icon(Icons.paste, color: iconColor),
-                    const SizedBox(width: 12),
-                    const Text('Import JSON'),
-                  ],
-                ),
+                child: Row(children: [Icon(Icons.paste, color: iconColor), const SizedBox(width: 12), const Text('Import JSON (Clipboard)')]),
+              ),
+              const PopupMenuDivider(),
+              PopupMenuItem<String>(
+                value: 'qr_export_all',
+                child: Row(children: [Icon(Icons.qr_code_2, color: iconColor), const SizedBox(width: 12), const Text('Show All as QR')]),
+              ),
+              PopupMenuItem<String>(
+                value: 'qr_scan',
+                child: Row(children: [Icon(Icons.qr_code_scanner, color: iconColor), const SizedBox(width: 12), const Text('Scan QR Code')]),
               ),
             ],
           ),
           const SizedBox(width: 8),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
+      floatingActionButton: isSelectionMode
+          ? null
+          : FloatingActionButton(
         backgroundColor: isDark ? Colors.white : Colors.black,
         foregroundColor: isDark ? Colors.black : Colors.white,
         onPressed: () {
@@ -388,27 +475,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
       body: ListenableBuilder(
           listenable: widget.state,
           builder: (context, _) {
-            final filteredNotes = widget.state.notes.where((note) {
-              return note.word.toLowerCase().contains(searchQuery) ||
-                  note.meaning.toLowerCase().contains(searchQuery);
-            }).toList();
-
             return Column(
               children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: TextField(
-                    decoration: InputDecoration(
-                      hintText: 'Search notes...',
-                      prefixIcon: const Icon(Icons.search, color: Colors.grey),
-                      filled: true,
-                      fillColor: isDark ? Colors.grey.shade900 : Colors.grey.shade200,
-                      contentPadding: EdgeInsets.zero,
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(30), borderSide: BorderSide.none),
+                if (!isSelectionMode)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    child: TextField(
+                      decoration: InputDecoration(
+                        hintText: 'Search notes...',
+                        prefixIcon: const Icon(Icons.search, color: Colors.grey),
+                        filled: true,
+                        fillColor: isDark ? Colors.grey.shade900 : Colors.grey.shade200,
+                        contentPadding: EdgeInsets.zero,
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(30), borderSide: BorderSide.none),
+                      ),
+                      onChanged: (val) => setState(() => searchQuery = val.toLowerCase()),
                     ),
-                    onChanged: (val) => setState(() => searchQuery = val.toLowerCase()),
                   ),
-                ),
                 Expanded(child: _buildStaggeredGrid(filteredNotes)),
               ],
             );
@@ -422,37 +505,74 @@ class _LibraryScreenState extends State<LibraryScreen> {
 class NoteCard extends StatelessWidget {
   final VocabNote note;
   final VocabState state;
+  final bool isSelectionMode;
+  final bool isSelected;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
 
-  const NoteCard({super.key, required this.note, required this.state});
+  const NoteCard({
+    super.key,
+    required this.note,
+    required this.state,
+    required this.isSelectionMode,
+    required this.isSelected,
+    required this.onTap,
+    required this.onLongPress,
+  });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
     return GestureDetector(
-      onTap: () {
-        Navigator.push(context, MaterialPageRoute(builder: (_) => AddNoteScreen(state: state, existingNote: note)));
-      },
+      onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         width: double.infinity,
         margin: const EdgeInsets.all(4),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-            color: theme.cardColor,
+            color: isSelected ? Colors.blue.withOpacity(0.15) : theme.cardColor,
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: state.isDarkMode ? Colors.grey.shade800 : Colors.grey.shade300),
+            border: Border.all(
+              color: isSelected
+                  ? Colors.blue
+                  : (state.isDarkMode ? Colors.grey.shade800 : Colors.grey.shade300),
+              width: isSelected ? 2 : 1,
+            ),
             boxShadow: [
               BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 4, offset: const Offset(0, 2))
             ]
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Stack(
           children: [
-            Text(note.word, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: theme.textTheme.bodyLarge?.color)),
-            if (note.meaning.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(note.meaning, style: TextStyle(fontSize: 14, color: state.isDarkMode ? Colors.grey.shade400 : Colors.black54)),
-            ]
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                    note.word,
+                    style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                        color: isSelected ? Colors.blue : theme.textTheme.bodyLarge?.color
+                    )
+                ),
+                if (note.meaning.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(note.meaning, style: TextStyle(fontSize: 14, color: state.isDarkMode ? Colors.grey.shade400 : Colors.black54)),
+                ]
+              ],
+            ),
+            if (isSelectionMode)
+              Positioned(
+                top: 0,
+                right: 0,
+                child: Icon(
+                  isSelected ? Icons.check_circle : Icons.radio_button_unchecked,
+                  color: isSelected ? Colors.blue : Colors.grey.shade400,
+                  size: 20,
+                ),
+              ),
           ],
         ),
       ),
@@ -513,7 +633,15 @@ class _AddNoteScreenState extends State<AddNoteScreen> {
         appBar: AppBar(
           title: Text(isEditing ? 'Edit Note' : 'New Note'),
           actions: [
-            if (isEditing)
+            if (isEditing) ...[
+              IconButton(
+                icon: const Icon(Icons.qr_code, color: Colors.blue),
+                tooltip: 'Show QR Code',
+                onPressed: () {
+                  final jsonString = json.encode([widget.existingNote!.toJson()]);
+                  Navigator.push(context, MaterialPageRoute(builder: (_) => QRExportScreen(payload: jsonString)));
+                },
+              ),
               IconButton(
                 icon: const Icon(Icons.delete_outline, color: Colors.red),
                 onPressed: () {
@@ -521,6 +649,7 @@ class _AddNoteScreenState extends State<AddNoteScreen> {
                   Navigator.pop(context);
                 },
               ),
+            ]
           ],
           bottom: isEditing ? null : TabBar(
             indicatorColor: isDark ? Colors.white : Colors.black,
@@ -595,6 +724,187 @@ class _AddNoteScreenState extends State<AddNoteScreen> {
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// --- QR EXPORT (ANIMATED FLIPBOOK) ---
+class QRExportScreen extends StatefulWidget {
+  final String payload;
+  const QRExportScreen({super.key, required this.payload});
+
+  @override
+  State<QRExportScreen> createState() => _QRExportScreenState();
+}
+
+class _QRExportScreenState extends State<QRExportScreen> {
+  final int chunkSize = 800;
+  List<String> chunks = [];
+  Timer? timer;
+  int currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    String jsonStr = widget.payload;
+
+    if (jsonStr.length <= chunkSize) {
+      chunks.add(jsonStr);
+    } else {
+      int total = (jsonStr.length / chunkSize).ceil();
+      for (int i = 0; i < total; i++) {
+        int start = i * chunkSize;
+        int end = (start + chunkSize < jsonStr.length) ? start + chunkSize : jsonStr.length;
+        chunks.add("VQR|${i + 1}|$total|${jsonStr.substring(start, end)}");
+      }
+    }
+
+    if (chunks.length > 1) {
+      timer = Timer.periodic(const Duration(milliseconds: 1000), (t) {
+        if (mounted) {
+          setState(() {
+            currentIndex = (currentIndex + 1) % chunks.length;
+          });
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Scan Me')),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(16),
+              color: Colors.white,
+              child: QrImageView(
+                data: chunks[currentIndex],
+                version: QrVersions.auto,
+                size: 300.0,
+              ),
+            ),
+            const SizedBox(height: 32),
+            if (chunks.length > 1) ...[
+              Text(
+                'Data is massive. Flashing sequence...',
+                style: TextStyle(color: Colors.grey.shade500, fontSize: 14),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Part ${currentIndex + 1} of ${chunks.length}',
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+            ] else
+              const Text('Scan this code to import data', style: TextStyle(fontSize: 16)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// --- QR SCANNER ---
+class QRScannerScreen extends StatefulWidget {
+  const QRScannerScreen({super.key});
+
+  @override
+  State<QRScannerScreen> createState() => _QRScannerScreenState();
+}
+
+class _QRScannerScreenState extends State<QRScannerScreen> {
+  bool _isDone = false;
+  Set<int> scannedIndices = {};
+  int totalExpected = 1;
+  List<String> payloadChunks = [];
+
+  void _handleScannedCode(String code) {
+    if (_isDone) return;
+
+    if (code.startsWith("VQR|")) {
+      var parts = code.split('|');
+      if (parts.length >= 4) {
+        int index = int.tryParse(parts[1]) ?? 1;
+        int total = int.tryParse(parts[2]) ?? 1;
+        String payload = parts.sublist(3).join('|');
+
+        if (payloadChunks.isEmpty) {
+          payloadChunks = List.filled(total, "");
+          totalExpected = total;
+        }
+
+        if (!scannedIndices.contains(index)) {
+          setState(() {
+            payloadChunks[index - 1] = payload;
+            scannedIndices.add(index);
+          });
+
+          if (scannedIndices.length == totalExpected) {
+            _isDone = true;
+            Navigator.pop(context, payloadChunks.join(""));
+          }
+        }
+      }
+    } else {
+      _isDone = true;
+      Navigator.pop(context, code);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Scanner')),
+      body: Stack(
+        children: [
+          MobileScanner(
+            onDetect: (capture) {
+              for (final barcode in capture.barcodes) {
+                if (barcode.rawValue != null) {
+                  _handleScannedCode(barcode.rawValue!);
+                }
+              }
+            },
+          ),
+          if (totalExpected > 1)
+            Positioned(
+              bottom: 40,
+              left: 20,
+              right: 20,
+              child: Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                    color: Colors.black87,
+                    borderRadius: BorderRadius.circular(16)
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Collecting pieces: ${scannedIndices.length} / $totalExpected',
+                      style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Keep the camera pointed at the flashing QR codes until complete.',
+                      style: TextStyle(color: Colors.white70, fontSize: 14),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
+        ],
       ),
     );
   }
